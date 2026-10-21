@@ -11,6 +11,33 @@ const consumer = kafka.consumer({
     groupId: "analitica-v2",
 });
 
+const producer = kafka.producer();
+
+const TOPIC_DLQ = "envios.estados.dlq";
+
+async function enviarADLQ(mensajeOriginal, motivo, topic, partition, offset) {
+    await producer.send({
+        topic: TOPIC_DLQ,
+        messages: [
+            {
+                key: "evento-invalido",
+                value: JSON.stringify({
+                    eventoOriginal: mensajeOriginal,
+                    motivo,
+                    topicOrigen: topic,
+                    partition,
+                    offset,
+                    enviadoEn: new Date().toISOString(),
+                }),
+            },
+        ],
+    });
+
+    console.warn(
+        `Evento enviado a DLQ: motivo=${motivo}, topic=${topic}, partición=${partition}, offset=${offset}`
+    );
+}
+
 const mongo = new MongoClient(
     process.env.MONGO_URL || "mongodb://localhost:27017/?replicaSet=rs0"
 );
@@ -106,37 +133,98 @@ async function guardarReprogramacion(evento) {
     );
 }
 
-async function procesarMensaje(topic, message) {
-    if (!message.value) {
-        console.warn(`Mensaje vacío en ${topic}; se ignora.`);
-        return;
-    }
+
+async function procesarMensaje(topic, message, partition, offset) {
+    const texto = message.value?.toString() ?? "";
 
     let evento;
 
     try {
-        evento = JSON.parse(message.value.toString());
+        evento = JSON.parse(texto);
     } catch {
-        console.error(`JSON inválido en ${topic}; se ignora.`);
+        await enviarADLQ(
+            texto,
+            "JSON_MALFORMADO",
+            topic,
+            partition,
+            offset
+        );
         return;
     }
 
-    if (!evento.shipmentId) {
-        console.warn(`Evento sin shipmentId en ${topic}; se ignora.`);
+    if (
+        !evento ||
+        typeof evento !== "object" ||
+        Array.isArray(evento) ||
+        typeof evento.shipmentId !== "string" ||
+        !evento.shipmentId.trim()
+    ) {
+        await enviarADLQ(
+            evento ?? texto,
+            "ESQUEMA_INVALIDO",
+            topic,
+            partition,
+            offset
+        );
         return;
     }
 
     if (topic === "envios.estados") {
-        if (!evento.eventId || !evento.tipo) {
-            console.warn("Evento de estado incompleto; se ignora.");
+        if (
+            typeof evento.eventId !== "string" ||
+            !evento.eventId.trim() ||
+            typeof evento.tipo !== "string" ||
+            !evento.tipo.trim()
+        ) {
+            await enviarADLQ(
+                evento,
+                "EVENTO_ESTADO_INCOMPLETO",
+                topic,
+                partition,
+                offset
+            );
             return;
         }
 
         await guardarEstado(evento);
     } else if (topic === "envios.promesas") {
+        if (!fechaValida(evento.fechaPrometida)) {
+            await enviarADLQ(
+                evento,
+                "PROMESA_INVALIDA",
+                topic,
+                partition,
+                offset
+            );
+            return;
+        }
+
         await guardarPromesa(evento);
     } else if (topic === "envios.reprogramaciones") {
+        if (
+            typeof evento.eventId !== "string" ||
+            !evento.eventId.trim()
+        ) {
+            await enviarADLQ(
+                evento,
+                "REPROGRAMACION_SIN_EVENT_ID",
+                topic,
+                partition,
+                offset
+            );
+            return;
+        }
+
         await guardarReprogramacion(evento);
+    } else {
+        await enviarADLQ(
+            evento,
+            "TOPIC_NO_RECONOCIDO",
+            topic,
+            partition,
+            offset
+        );
+        return;
     }
 
     await recalcularMetricas();
@@ -145,6 +233,7 @@ async function procesarMensaje(topic, message) {
         `Analítica registrada: ${evento.shipmentId} | ${topic}`
     );
 }
+
 
 async function recalcularMetricas() {
     const estados = await eventosAnalitica.find({}).toArray();
@@ -406,6 +495,7 @@ async function iniciar() {
             { unique: true }
         );
 
+        await producer.connect();
         await consumer.connect();
 
         await consumer.subscribe({
@@ -424,34 +514,76 @@ async function iniciar() {
 
         await recalcularMetricas();
 
+
         await consumer.run({
-            eachMessage: async ({ topic, message }) => {
-                try {
-                    await procesarMensaje(topic, message);
-                } catch (error) {
-                    console.error(
-                        "Error procesando analítica:",
-                        error.message
-                    );
-                }
+            autoCommit: false,
+            eachMessage: async ({
+                topic,
+                partition,
+                message,
+                heartbeat,
+            }) => {
+                const offset = message.offset;
+
+                // Si el procesamiento falla, el error se propaga
+                // y el offset no se confirma.
+                await procesarMensaje(topic, message, partition, offset);
+
+                // Confirmar después de completar el procesamiento.
+                await consumer.commitOffsets([
+                    {
+                        topic,
+                        partition,
+                        offset: (BigInt(offset) + 1n).toString(),
+                    },
+                ]);
+
+                await heartbeat();
             },
         });
+
+
     } catch (error) {
         console.error("No se pudo iniciar analítica:", error);
         process.exitCode = 1;
+
+        try {
+            await consumer.disconnect();
+        } catch { }
+
+        try {
+            await producer.disconnect();
+        } catch { }
+
+        try {
+            await mongo.close();
+        } catch { }
     }
 }
+
 
 async function cerrar() {
     console.log("Cerrando servicio de analítica...");
 
     try {
         await consumer.disconnect();
+    } catch (error) {
+        console.error("Error al desconectar Kafka:", error.message);
+    }
+
+    try {
+        await producer.disconnect();
+    } catch (error) {
+        console.error("Error al desconectar el productor:", error.message);
+    }
+
+    try {
         await mongo.close();
     } catch (error) {
-        console.error("Error durante el cierre:", error.message);
+        console.error("Error al cerrar MongoDB:", error.message);
     }
 }
+
 
 process.on("SIGINT", async () => {
     await cerrar();
