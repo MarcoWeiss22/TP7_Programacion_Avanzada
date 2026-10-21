@@ -19,6 +19,7 @@ const mongo = new MongoClient(MONGO_URL);
 const TOPIC_ESTADOS = "envios.estados";
 const TOPIC_REPROGRAMACIONES = "envios.reprogramaciones";
 const TOPIC_NOTIFICACIONES = "notificaciones.enviadas";
+const TOPIC_ALERTAS_SLA = "alertas.sla";
 const TOPIC_DLQ = "envios.estados.dlq";
 
 // Comprueba los campos comunes de los eventos.
@@ -282,6 +283,64 @@ async function procesarNotificacion(
     );
 }
 
+// Procesa las alertas publicadas por el monitor SLA.
+async function procesarAlertaSLA(evento, alertas, procesados) {
+    const identificador = evento.alertaId;
+
+    if (
+        typeof identificador !== "string" ||
+        identificador.length === 0 ||
+        typeof evento.shipmentId !== "string" ||
+        evento.shipmentId.length === 0 ||
+        typeof evento.regla !== "string" ||
+        evento.regla.length === 0 ||
+        !["ABIERTA", "CERRADA"].includes(evento.estado)
+    ) {
+        throw new Error("ALERTA_SLA_INVALIDA");
+    }
+
+    const eventId = [
+        "alerta-sla",
+        identificador,
+        evento.estado,
+        evento.actualizadaEn || evento.cerradaEn || evento.creadaEn || "",
+    ].join(":");
+
+    const existente = await procesados.findOne({
+        consumer: "proyector",
+        eventId,
+    });
+
+    if (existente) {
+        console.log(`Actualización de alerta duplicada ignorada: ${eventId}`);
+        return;
+    }
+
+    const { _id, ...camposAlerta } = evento;
+
+    await alertas.updateOne(
+        { alertaId: identificador },
+        {
+            $set: {
+                ...camposAlerta,
+                actualizadaEn:
+                    evento.actualizadaEn || new Date().toISOString(),
+            },
+        },
+        { upsert: true }
+    );
+
+    await registrarEventoProcesado(
+        procesados,
+        eventId,
+        TOPIC_ALERTAS_SLA
+    );
+
+    console.log(
+        `Alerta SLA sincronizada: ${identificador} | ${evento.estado}`
+    );
+}
+
 // Comprueba que cada tipo de evento tenga sus campos necesarios.
 function validarContenidoEvento(evento, topic) {
     if (topic === TOPIC_ESTADOS) {
@@ -345,6 +404,23 @@ function validarContenidoEvento(evento, topic) {
         }
     }
 
+    if (topic === TOPIC_ALERTAS_SLA) {
+        if (
+            evento === null ||
+            typeof evento !== "object" ||
+            Array.isArray(evento) ||
+            typeof evento.alertaId !== "string" ||
+            evento.alertaId.length === 0 ||
+            typeof evento.shipmentId !== "string" ||
+            evento.shipmentId.length === 0 ||
+            typeof evento.regla !== "string" ||
+            evento.regla.length === 0 ||
+            !["ABIERTA", "CERRADA"].includes(evento.estado)
+        ) {
+            return "ALERTA_SLA_INVALIDA";
+        }
+    }
+
     return null;
 }
 
@@ -353,6 +429,7 @@ async function iniciarProyector() {
 
     const db = mongo.db("rutasur");
     const envios = db.collection("envios");
+    const alertas = db.collection("alertas");
     const procesados = db.collection("eventos_procesados");
 
     await envios.createIndex(
@@ -373,6 +450,7 @@ async function iniciarProyector() {
             TOPIC_ESTADOS,
             TOPIC_REPROGRAMACIONES,
             TOPIC_NOTIFICACIONES,
+            TOPIC_ALERTAS_SLA,
         ],
         fromBeginning: true,
     });
@@ -418,7 +496,7 @@ async function iniciarProyector() {
             }
 
             // Paso 2: comprobar los campos comunes.
-            if (!validarEvento(evento)) {
+            if (topic !== TOPIC_ALERTAS_SLA && !validarEvento(evento)) {
                 await enviarADLQ(
                     evento,
                     "ESQUEMA_INVALIDO",
@@ -483,6 +561,12 @@ async function iniciarProyector() {
                 await procesarNotificacion(
                     evento,
                     envios,
+                    procesados
+                );
+            } else if (topic === TOPIC_ALERTAS_SLA) {
+                await procesarAlertaSLA(
+                    evento,
+                    alertas,
                     procesados
                 );
             } else {

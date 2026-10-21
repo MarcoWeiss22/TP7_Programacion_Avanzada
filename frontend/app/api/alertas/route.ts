@@ -24,8 +24,7 @@ export async function GET() {
         const db = client.db("rutasur");
 
         const alertas = await db
-            .collection("alertas_sla")
-            .find(
+            .collection("alertas").find(
                 {},
                 {
                     projection: {
