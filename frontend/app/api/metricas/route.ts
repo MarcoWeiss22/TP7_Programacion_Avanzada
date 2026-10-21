@@ -26,7 +26,7 @@ export async function GET() {
         const db = client.db("rutasur");
 
         const metricas = await db
-            .collection("metricas_analitica")
+            .collection<{ _id: string }>("metricas_analitica")
             .findOne({ _id: "indicadores_actuales" });
 
         if (!metricas) {
