@@ -1,6 +1,7 @@
 import { Kafka } from "kafkajs";
 import { MongoClient } from "mongodb";
 import { randomUUID } from "node:crypto";
+import { obtenerNotificacion } from "./lib/deduplicacion.js";
 
 const MONGO_URL = "mongodb://localhost:27017/?replicaSet=rs0";
 
@@ -92,28 +93,12 @@ async function iniciarNotificaciones() {
             let notificacion;
 
             try {
-                notificacion = await notificaciones.findOneAndUpdate(
-                    { eventoOrigenId: evento.eventId },
-                    {
-                        $setOnInsert: {
-                            eventId: randomUUID(),
-                            eventoOrigenId: evento.eventId,
-                            shipmentId: evento.shipmentId,
-                            tipo: "NOTIFICACION_ENTREGA_FALLIDA",
-                            motivo: evento.motivo ?? "NO_ESPECIFICADO",
-                            mensaje:
-                                `El envío ${evento.shipmentId} no pudo entregarse. ` +
-                                "Contacte al operador para conocer las opciones disponibles.",
-                            ocurridoEn: new Date().toISOString(),
-                            version: 1,
-                            publicado: false,
-                        },
-                    },
-                    {
-                        upsert: true,
-                        returnDocument: "after",
-                    }
-                );
+                notificacion = await obtenerNotificacion({
+                    notificaciones,
+                    evento,
+                    generarId: randomUUID,
+                    obtenerFecha: () => new Date().toISOString(),
+                });
 
                 notificacion = notificacion?.value ?? notificacion;
 
