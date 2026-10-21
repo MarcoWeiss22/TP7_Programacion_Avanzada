@@ -37,12 +37,21 @@ const estadosOrdenados = [
     "ENTREGADO",
 ];
 
+
 function estadoYaAlcanzo(estadoActual, estadoObjetivo) {
+    if (estadoActual === "ENTREGA_FALLIDA") {
+        return (
+            estadosOrdenados.indexOf(estadoObjetivo) <=
+            estadosOrdenados.indexOf("EN_REPARTO")
+        );
+    }
+
     const actual = estadosOrdenados.indexOf(estadoActual);
     const objetivo = estadosOrdenados.indexOf(estadoObjetivo);
 
     return actual !== -1 && objetivo !== -1 && actual >= objetivo;
 }
+
 
 function mismoDia(fechaA, fechaB) {
     const a = new Date(fechaA);
@@ -507,6 +516,15 @@ async function procesarMensaje(topic, mensaje) {
                         evento.ocurridoEn || new Date().toISOString(),
                     hubId: evento.hubId || envioActual?.hubId || null,
                     zonaId: evento.zonaId || envioActual?.zonaId || null,
+                    ultimoFalloEn:
+                        evento.tipo === "ENTREGA_FALLIDA"
+                            ? evento.ocurridoEn || new Date().toISOString()
+                            : envioActual?.ultimoFalloEn || null,
+
+                    ultimoMotivoFallo:
+                        evento.tipo === "ENTREGA_FALLIDA"
+                            ? evento.motivo || "NO_ESPECIFICADO"
+                            : envioActual?.ultimoMotivoFallo || null,
                 },
                 $setOnInsert: {
                     relojSimuladoEn:
